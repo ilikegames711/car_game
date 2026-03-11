@@ -1,0 +1,496 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Infinite Road — Fixed Start</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root{--ui:#0b1220; --panel:rgba(0,0,0,0.6); --accent:#ffcc00}
+  html,body{height:100%;margin:0;background:#081024;color:#fff;font-family:Inter,Arial,Helvetica,sans-serif}
+  canvas{display:block;width:100%;height:100vh}
+  #menu{
+    position:fixed;inset:0;display:flex;flex-direction:column;gap:10px;
+    align-items:center;justify-content:center;background:var(--panel);
+  }
+  .panel{background:rgba(255,255,255,0.03);padding:12px;border-radius:8px;min-width:280px;text-align:center}
+  label{display:block;margin-bottom:6px;font-size:14px}
+  select,input[type="color"],button{padding:8px 10px;font-size:14px;border-radius:6px;border:0;outline:none}
+  button{cursor:pointer;background:var(--accent);color:#111;font-weight:700}
+  #hud{position:fixed;right:16px;top:12px;text-align:right;line-height:1.3}
+  #message{position:fixed;left:50%;bottom:36px;transform:translateX(-50%);font-size:20px;font-weight:800;color:#ffd700;opacity:0;transition:opacity .18s}
+  .small{font-size:13px;color:#cbd5e1}
+</style>
+</head>
+<body>
+
+<canvas id="game"></canvas>
+
+<!-- MENU -->
+<div id="menu" role="dialog" aria-label="Game menu">
+  <div class="panel" style="min-width:320px;">
+    <h2 style="margin:6px 0 10px 0">Infinite Road</h2>
+
+    <div style="display:flex;gap:8px;justify-content:center;margin-bottom:8px;align-items:center">
+      <div>
+        <label for="carColor">Car color</label>
+        <input id="carColor" type="color" value="#ff0000">
+      </div>
+
+      <div>
+        <label for="carSelect">Car</label>
+        <select id="carSelect">
+          <option value="starter">Starter (free)</option>
+          <option value="sport">Sport (500 coins)</option>
+          <option value="grip">Grip (800 coins)</option>
+          <option value="turbo">Turbo (1200 coins)</option>
+        </select>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:8px;justify-content:center">
+      <button id="startBtn">Start Game</button>
+      <button id="achBtn" type="button">Achievements</button>
+    </div>
+
+    <div class="small" style="margin-top:10px">
+      <div id="coinsDisplay">Coins: 0</div>
+      <div id="highDisplay">High: 0</div>
+    </div>
+  </div>
+</div>
+
+<div id="hud" aria-hidden="false"></div>
+<div id="message" aria-live="polite"></div>
+
+<script>
+/* ---------- SAFE INITIALIZATION ---------- */
+window.addEventListener('DOMContentLoaded', ()=>{
+
+  /* canvas */
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  function resize(){ canvas.width = innerWidth; canvas.height = innerHeight; }
+  window.addEventListener('resize', resize);
+  resize();
+
+  /* DOM */
+  const menu = document.getElementById('menu');
+  const startBtn = document.getElementById('startBtn');
+  const carColorInput = document.getElementById('carColor');
+  const carSelect = document.getElementById('carSelect');
+  const coinsDisplay = document.getElementById('coinsDisplay');
+  const highDisplay = document.getElementById('highDisplay');
+  const hud = document.getElementById('hud');
+  const messageEl = document.getElementById('message');
+  const achBtn = document.getElementById('achBtn');
+
+  /* persistent storage (parse as integers to avoid string/number bugs) */
+  let coinsSaved = parseInt(localStorage.getItem('ir_coins') || '0', 10);
+  let highScore = parseInt(localStorage.getItem('ir_high') || '0', 10);
+
+  function updateDisplays(){
+    coinsDisplay.textContent = 'Coins: ' + coinsSaved;
+    highDisplay.textContent = 'High: ' + highScore;
+  }
+  updateDisplays();
+
+  /* Game state */
+  let running = false;
+  let score = 0;
+  let speed = 3;
+  let baseRoadWidth = 160;
+  let segmentH = 100;
+  let road = [];             // segments {x,y,w}
+  let coins = [];            // {x,y,size,taken}
+  let powerups = [];         // {x,y,type,taken}
+  let clouds = [];
+
+  /* Powerups / progression */
+  let magnet = false;
+  let shield = false;
+  let superBoost = false;
+  let doubleCoins = false;
+  let magnetTimer = 0;
+  let boostTimer = 0;
+  let doubleTimer = 0;
+
+  let streak = 0;
+  let coinMultiplier = 1;
+
+  /* Worlds/Weather */
+  const worlds = ['city','desert','forest','ice'];
+  const weathers = ['clear','rain','fog','storm'];
+  let world = 'city';
+  let weather = 'clear';
+  let night = false;
+
+  /* Cars */
+  const cars = {
+    starter: {speed:1, turn:1, cost:0},
+    sport:   {speed:1.2, turn:1, cost:500},
+    grip:    {speed:1, turn:1.4, cost:800},
+    turbo:   {speed:1.45, turn:0.95, cost:1200}
+  };
+  let currentCarId = 'starter';
+  let car = { x:0, y:0, w:60, h:110, color:'#ff0000', speed:1, turn:1 };
+
+  /* inputs */
+  let left = false, right = false;
+  document.addEventListener('keydown', e=>{
+    if(e.key === 'ArrowLeft' || e.key === 'a') left = true;
+    if(e.key === 'ArrowRight' || e.key === 'd') right = true;
+  });
+  document.addEventListener('keyup', e=>{
+    if(e.key === 'ArrowLeft' || e.key === 'a') left = false;
+    if(e.key === 'ArrowRight' || e.key === 'd') right = false;
+  });
+
+  /* helper - spawn initial road */
+  function initRoad(){
+    road = [];
+    const startX = Math.round(canvas.width/2 - baseRoadWidth/2);
+    for(let i=0;i<Math.ceil(canvas.height/segmentH)+6;i++){
+      road.push({ x:startX, y:canvas.height - i*segmentH, w:baseRoadWidth });
+    }
+  }
+
+  /* spawn coin/powerup helpers */
+  function spawnCoin(seg){
+    const margin = 12;
+    const x = Math.max(seg.x+margin, Math.min(seg.x+seg.w-margin, seg.x + Math.random()*(seg.w - margin*2)));
+    coins.push({ x, y: seg.y - segmentH/2, size:12, taken:false });
+  }
+  function spawnPower(seg){
+    const types = ['magnet','shield','boost','double'];
+    const type = types[Math.floor(Math.random()*types.length)];
+    const margin = 16;
+    const x = Math.max(seg.x+margin, Math.min(seg.x+seg.w-margin, seg.x + Math.random()*(seg.w - margin*2)));
+    powerups.push({ x, y: seg.y - segmentH/2, type, taken:false });
+  }
+
+  /* Start the game - robust check for car unlocks */
+  function startGame(){
+    // length-safety: read coinsSaved fresh from storage in case UI changed externally
+    coinsSaved = parseInt(localStorage.getItem('ir_coins') || String(coinsSaved || 0), 10);
+    updateDisplays();
+
+    const chosen = carSelect.value || 'starter';
+    const price = (cars[chosen] && cars[chosen].cost) ? cars[chosen].cost : 0;
+
+    if(price > 0 && coinsSaved < price){
+      // not enough coins -> fallback but notify
+      alert('Not enough coins to use that car. Starting with Starter car.');
+      currentCarId = 'starter';
+    } else {
+      currentCarId = chosen;
+      // If player can afford and chooses a paid car, do NOT auto-purchase here; only unlocking via store would subtract coins.
+      // For simplicity we treat the car as selectable but NOT charged automatically.
+    }
+
+    // Apply car stats & color
+    car.color = carColorInput.value || '#ff0000';
+    car.speed = cars[currentCarId].speed;
+    car.turn = cars[currentCarId].turn;
+
+    // Reset game state
+    score = 0;
+    speed = 3;
+    streak = 0;
+    coinMultiplier = 1;
+    magnet = shield = superBoost = doubleCoins = false;
+    magnetTimer = boostTimer = doubleTimer = 0;
+    coins = [];
+    powerups = [];
+    clouds = [];
+    world = worlds[Math.floor(Math.random()*worlds.length)];
+    weather = 'clear';
+    night = false;
+
+    initRoad();
+    // car position: center of current visible road
+    car.x = canvas.width/2;
+    car.y = canvas.height - 150;
+    running = true;
+    menu.style.display = 'none';
+    messageEl.style.opacity = 0;
+  }
+
+  startBtn.addEventListener('click', startGame);
+
+  achBtn.addEventListener('click', ()=> {
+    // simple achievements dialog
+    const msgs = [];
+    msgs.push('Achievements:');
+    msgs.push('- Reach 1000 score');
+    msgs.push('- Collect 50 coins total');
+    msgs.push('- Get 10 close calls');
+    alert(msgs.join('\n'));
+  });
+
+  /* small utility to show temporary message */
+  let messageTimeout = null;
+  function showMessage(text, ms=900){
+    messageEl.textContent = text;
+    messageEl.style.opacity = 1;
+    if(messageTimeout) clearTimeout(messageTimeout);
+    messageTimeout = setTimeout(()=>{ messageEl.style.opacity = 0; }, ms);
+  }
+
+  /* Main update loop */
+  function update(dt){
+    if(!running) return;
+
+    // handle timers
+    if(magnet){ magnetTimer--; if(magnetTimer<=0) magnet=false; }
+    if(doubleCoins){ doubleTimer--; if(doubleTimer<=0) doubleCoins=false; }
+    if(superBoost){ boostTimer--; if(boostTimer<=0) superBoost=false; }
+
+    // difficulty ramp & score
+    speed += 0.0009 * car.speed; // ramp faster with car speed stat
+    score += Math.max(0.2, speed*0.12);
+
+    // random world/weather changes as game progresses
+    if(Math.random() < 0.0008) {
+      weather = weathers[Math.floor(Math.random()*weathers.length)];
+    }
+    if(Math.random() < 0.0005) {
+      world = worlds[Math.floor(Math.random()*worlds.length)];
+    }
+    if(Math.random() < 0.0006) night = !night;
+
+    // move road down
+    for(const seg of road) seg.y += speed;
+
+    // recycle segments
+    if(road.length && road[0].y > canvas.height + segmentH){
+      const removed = road.shift();
+      const prev = road[road.length-1];
+      // road width sometimes becomes narrow to create skill zones
+      const narrow = (Math.random() < 0.18);
+      const segW = narrow ? Math.max(90, baseRoadWidth - 70) : baseRoadWidth;
+      // shift left/right more aggressively as game continues
+      const maxShift = 120 + Math.min(120, Math.floor(score/500));
+      let nx = prev.x + (Math.random()*2 - 1) * maxShift;
+      nx = Math.max(24, Math.min(canvas.width - segW - 24, nx));
+      road.push({ x: nx, y: prev.y - segmentH, w: segW });
+
+      // sometimes spawn coins / powerups on new segment
+      if(Math.random() < 0.35) spawnCoin(road[road.length-1]);
+      if(Math.random() < 0.12) spawnPower(road[road.length-1]);
+    }
+
+    // clouds drift (visual)
+    if(world === 'city' || world === 'desert'){
+      if(clouds.length < 6 && Math.random() < 0.01) clouds.push({x: Math.random()*canvas.width, y: Math.random()*canvas.height*0.5});
+      for(const c of clouds){ c.x += 0.25 + Math.random()*0.3; if(c.x > canvas.width+80) c.x = -80; }
+    }
+
+    // lateral car movement (based on car.turn stat)
+    if(left) car.x -= 6 * car.turn;
+    if(right) car.x += 6 * car.turn;
+    // clamp to screen
+    car.x = Math.max(0, Math.min(canvas.width, car.x));
+
+    // move coins/powerups down & handle interactions
+    for(const c of coins){
+      c.y += speed;
+      if(magnet && !c.taken){
+        // gently pull to car
+        c.x += (car.x - c.x) * 0.06;
+        c.y += (car.y - c.y) * 0.06;
+      }
+      if(!c.taken && Math.hypot(car.x - c.x, (car.y - c.y)) < 48){
+        c.taken = true;
+        streak++;
+        // multiplier
+        if(streak >= 10) coinMultiplier = 3;
+        else if(streak >= 5) coinMultiplier = 2;
+        else coinMultiplier = 1;
+
+        const coinValue = 10 * coinMultiplier * (doubleCoins ? 2 : 1);
+        score += coinValue;
+        coinsSaved += 1;
+        // small visual message
+        showMessage('Coin +'+coinValue, 700);
+      }
+    }
+
+    for(const p of powerups){
+      p.y += speed;
+      if(!p.taken && Math.hypot(car.x - p.x, (car.y - p.y)) < 52){
+        p.taken = true;
+        switch(p.type){
+          case 'magnet': magnet = true; magnetTimer = 180; showMessage('Magnet!', 900); break;
+          case 'shield': shield = true; showMessage('Shield Ready', 900); break;
+          case 'boost': superBoost = true; boostTimer = 120; speed += 2; showMessage('Boost!', 900); break;
+          case 'double': doubleCoins = true; doubleTimer = 240; showMessage('Double Coins!', 900); break;
+        }
+      }
+    }
+
+    // close call detection & edge bonus
+    let onRoad = false;
+    for(const seg of road){
+      if(car.y + car.h > seg.y && car.y < seg.y + segmentH){
+        // within this segment: check if car is between seg.x .. seg.x+seg.w
+        if(car.x > seg.x && car.x < seg.x + seg.w) {
+          onRoad = true;
+          // close to edges?
+          if(car.x < seg.x + 12 || car.x > seg.x + seg.w - 12){
+            // small bonus for risky driving
+            score += 0.8;
+            showMessage('Close Call +10', 600);
+            // we count close call occurrences for possible achievements
+          }
+        }
+      }
+    }
+
+    if(!onRoad){
+      if(shield){
+        // consume shield and respawn on center road
+        shield = false;
+        car.x = canvas.width/2;
+        showMessage('Shield used!', 900);
+        // keep running
+        return;
+      } else {
+        // game over flow
+        running = false;
+        const final = Math.floor(score);
+        if(final > highScore){ highScore = final; localStorage.setItem('ir_high', String(highScore)); }
+        localStorage.setItem('ir_coins', String(coinsSaved));
+        updateDisplays();
+        alert('You fell off!\nScore: '+final+'\nHigh: '+highScore);
+        menu.style.display = '';
+        return;
+      }
+    }
+  } // end update
+
+  /* DRAW: keep visuals polished but simple */
+  function draw(){
+    // background by world + night
+    let skyTop = '#87ceeb', skyBot = '#dbefff';
+    if(world === 'desert'){ skyTop = '#f4d27a'; skyBot = '#ffdca1'; }
+    if(world === 'forest'){ skyTop = '#6bc96b'; skyBot = '#cfeec1'; }
+    if(world === 'ice'){ skyTop = '#bfe8ff'; skyBot = '#e6f8ff'; }
+    if(night){ skyTop = '#071226'; skyBot = '#0f1926'; }
+    const g = ctx.createLinearGradient(0,0,0,canvas.height);
+    g.addColorStop(0, skyTop);
+    g.addColorStop(1, skyBot);
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+
+    // subtle weather overlays
+    if(weather === 'fog'){
+      ctx.fillStyle = 'rgba(230,230,230,0.08)';
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+    }
+
+    // clouds
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    for(const c of clouds) ctx.beginPath(), ctx.ellipse(c.x, c.y, 60, 22, 0, 0, Math.PI*2), ctx.fill();
+
+    // road segments
+    for(const seg of road){
+      // road body with slight gradient
+      const rg = ctx.createLinearGradient(seg.x, seg.y, seg.x+seg.w, seg.y+segmentH);
+      rg.addColorStop(0,'#3a3a3a'); rg.addColorStop(1,'#222');
+      ctx.fillStyle = rg;
+      ctx.fillRect(seg.x, seg.y, seg.w, segmentH);
+
+      // edges
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(seg.x, seg.y, seg.w, segmentH);
+
+      // center dashed line
+      ctx.save();
+      ctx.beginPath();
+      ctx.setLineDash([18, 16]);
+      ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+      ctx.lineWidth = 2;
+      ctx.moveTo(seg.x + seg.w/2, seg.y);
+      ctx.lineTo(seg.x + seg.w/2, seg.y + segmentH);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // coins
+    for(const c of coins){
+      if(c.taken) continue;
+      ctx.beginPath();
+      ctx.fillStyle = '#ffd700';
+      ctx.arc(c.x, c.y, c.size, 0, Math.PI*2);
+      ctx.fill();
+      // glow
+      ctx.fillStyle = 'rgba(255,215,0,0.12)';
+      ctx.beginPath(); ctx.arc(c.x, c.y, c.size+8, 0, Math.PI*2); ctx.fill();
+    }
+
+    // powerups
+    for(const p of powerups){
+      if(p.taken) continue;
+      const col = (p.type === 'magnet' ? '#66f' : p.type === 'shield' ? '#3498db' : p.type === 'boost' ? '#ff7a18' : '#ff66cc');
+      ctx.fillStyle = col;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 12, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = 'rgba(0,0,0,0.08)';
+      ctx.beginPath(); ctx.arc(p.x, p.y+3, 12, 0, Math.PI*2); ctx.fill();
+    }
+
+    // car (simple shaded rectangle + small exhaust when boost)
+    // draw car shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.fillRect(car.x - 24, car.y + car.h - 6, 48, 10);
+
+    // car body
+    const cg = ctx.createLinearGradient(car.x - 28, car.y, car.x + 28, car.y + car.h);
+    cg.addColorStop(0, car.color);
+    cg.addColorStop(1, '#660000');
+    ctx.fillStyle = cg;
+    ctx.fillRect(car.x - 28, car.y, 56, car.h * 0.8);
+
+    // windows
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    ctx.fillRect(car.x - 20, car.y + 8, 40, 18);
+
+    // boost flames
+    if(superBoost){
+      ctx.fillStyle = 'rgba(255,140,0,0.85)';
+      for(let i=0;i<5;i++){
+        ctx.beginPath();
+        ctx.ellipse(car.x - 14 + Math.random()*28, car.y + car.h + Math.random()*18, 6 + Math.random()*6, 10+Math.random()*8, 0,0,Math.PI*2);
+        ctx.fill();
+      }
+    }
+
+    // HUD
+    hud.innerHTML = `Score: <strong>${Math.floor(score)}</strong><br>High: <strong>${highScore}</strong><br>Coins: <strong>${coinsSaved}</strong><br>Streak: x${coinMultiplier}`;
+
+  } // end draw
+
+  /* loop (single RAF) */
+  function tick(){
+    update();
+    draw();
+    requestAnimationFrame(tick);
+  }
+  tick();
+
+  /* expose some debug helpers (optional) */
+  window.__IR = {
+    startGame, updateDisplays: updateDisplays,
+    giveCoins(n=100){ coinsSaved += n; localStorage.setItem('ir_coins', String(coinsSaved)); updateDisplays(); },
+    setWorld(w){ if(worlds.includes(w)) world = w; }
+  };
+
+  // little UX: update displays when menu visible
+  const obs = new MutationObserver(()=>{ if(menu.style.display !== 'none') updateDisplays(); });
+  obs.observe(menu, { attributes: true, attributeFilter: ['style'] });
+
+}); // DOMContentLoaded
+</script>
+
+</body>
+</html>
